@@ -1,3 +1,4 @@
+import os
 import re
 from datetime import datetime
 from urllib.parse import unquote, urljoin, urlparse
@@ -21,16 +22,19 @@ _COPYRIGHT_RE = re.compile(
 
 def _fetch_html(url: str, *, timeout: float = 8.0) -> str:
     try:
+        print(f"[http] GET {url} timeout={timeout}")
         resp = requests.get(
             url,
             timeout=timeout,
             allow_redirects=True,
             headers={"User-Agent": "lead-scraper/1.0"},
         )
+        print(f"[http] status={resp.status_code} final_url={resp.url}")
         if resp.status_code != 200:
             return ""
         return resp.text or ""
     except Exception:
+        _print_traceback()
         return ""
 
 
@@ -51,12 +55,14 @@ def analyze_website(url: str) -> dict:
         return result
 
     try:
+        print(f"[site] analyze_website GET {base}")
         resp = requests.get(
             base,
             timeout=8.0,
             allow_redirects=True,
             headers={"User-Agent": "lead-scraper/1.0"},
         )
+        print(f"[site] status={resp.status_code} final_url={resp.url}")
         final_url = (resp.url or base).strip()
         html = resp.text or ""
 
@@ -311,19 +317,28 @@ def _print_traceback() -> None:
 
 def _safe_get(url: str, params: dict, *, timeout: float = 30.0) -> dict | None:
     try:
+        print(f"[google] GET {url} timeout={timeout}")
         resp = requests.get(url, params=params, timeout=timeout)
+        print(f"[google] status={resp.status_code} final_url={resp.url}")
         try:
             data = resp.json()
         except Exception:
+            _print_traceback()
             data = None
 
         if resp.status_code != 200:
             print(f"HTTP {resp.status_code} {resp.url}")
-            print(resp.text)
+            txt = resp.text or ""
+            print(txt[:800])
             return None
 
         if isinstance(data, dict):
             status = data.get("status")
+            if url == PLACES_TEXTSEARCH_URL:
+                count = len(data.get("results", []) or [])
+                print(f"[google] TextSearch status={status} results={count}")
+            else:
+                print(f"[google] Details status={status}")
             if status in {"REQUEST_DENIED", "OVER_DAILY_LIMIT"}:
                 print("Google Places API error response:")
                 print(resp.text)
@@ -342,9 +357,10 @@ def _place_details(place_id: str, api_key: str) -> dict | None:
     return _safe_get(PLACES_DETAILS_URL, params)
 
 
-def search_businesses(city: str, category: str, api_key: str, verify_nosite: bool = False) -> list[dict]:
+def search_businesses(city: str, category: str, api_key: str | None = None, verify_nosite: bool = False) -> list[dict]:
     try:
-        api_key = (api_key or "").strip()
+        print(f"[search] city={city!r} category={category!r} verify_nosite={verify_nosite}")
+        api_key = (api_key or os.getenv("GOOGLE_API_KEY") or "").strip()
         if not api_key:
             raise RuntimeError("GOOGLE_API_KEY")
 
@@ -354,8 +370,10 @@ def search_businesses(city: str, category: str, api_key: str, verify_nosite: boo
             return []
 
         query = f"{category.strip()} in {city.strip()}"
+        print(f"[search] query={query!r}")
         payload = _safe_get(PLACES_TEXTSEARCH_URL, {"query": query, "key": api_key})
         if not payload:
+            print("[search] Text Search returned no payload")
             return []
 
         status = payload.get("status")
@@ -365,6 +383,7 @@ def search_businesses(city: str, category: str, api_key: str, verify_nosite: boo
             return []
 
         text_items: list[dict] = list(payload.get("results", []) or [])
+        print(f"[search] text_items={len(text_items)}")
 
         results: list[dict] = []
         for item in text_items:
@@ -420,7 +439,13 @@ def search_businesses(city: str, category: str, api_key: str, verify_nosite: boo
                     if not place_id:
                         continue
 
-                    details = _place_details(place_id, api_key)
+                    details_timeout = 10.0 if verify_nosite else 30.0
+                    params = {
+                        "place_id": place_id,
+                        "fields": "name,formatted_phone_number,website,formatted_address",
+                        "key": api_key,
+                    }
+                    details = _safe_get(PLACES_DETAILS_URL, params, timeout=details_timeout)
                     checked_count += 1
                     if not details or details.get("status") != "OK":
                         if isinstance(details, dict) and details.get("status") in {"REQUEST_DENIED", "OVER_DAILY_LIMIT"}:
@@ -442,24 +467,25 @@ def search_businesses(city: str, category: str, api_key: str, verify_nosite: boo
                     results[idx]["website_checked"] = True
 
                     if website:
-                        website_analysis = analyze_website(website)
-                        final_url = (
-                            (website_analysis.get("final_url") or website).strip()
-                            if isinstance(website_analysis, dict)
-                            else website
-                        )
-                        results[idx]["email"] = _find_email_on_website(final_url)
+                        if not verify_nosite:
+                            website_analysis = analyze_website(website)
+                            final_url = (
+                                (website_analysis.get("final_url") or website).strip()
+                                if isinstance(website_analysis, dict)
+                                else website
+                            )
+                            results[idx]["email"] = _find_email_on_website(final_url)
 
-                        if isinstance(website_analysis, dict) and website_analysis.get("reachable"):
-                            results[idx]["website_status"] = "reachable"
-                        else:
-                            results[idx]["website_status"] = "broken"
+                            if isinstance(website_analysis, dict) and website_analysis.get("reachable"):
+                                results[idx]["website_status"] = "reachable"
+                            else:
+                                results[idx]["website_status"] = "broken"
 
-                        if isinstance(website_analysis, dict):
-                            results[idx]["website_year_estimate"] = website_analysis.get("estimated_year")
-                            results[idx]["website_platform"] = (website_analysis.get("platform") or "unknown")
-                            results[idx]["website_outdated"] = bool(website_analysis.get("is_outdated"))
-                            results[idx]["website_notes"] = (website_analysis.get("notes") or "")
+                            if isinstance(website_analysis, dict):
+                                results[idx]["website_year_estimate"] = website_analysis.get("estimated_year")
+                                results[idx]["website_platform"] = (website_analysis.get("platform") or "unknown")
+                                results[idx]["website_outdated"] = bool(website_analysis.get("is_outdated"))
+                                results[idx]["website_notes"] = (website_analysis.get("notes") or "")
 
                         results[idx]["has_website"] = True
                     else:
@@ -495,6 +521,7 @@ def search_businesses(city: str, category: str, api_key: str, verify_nosite: boo
             deduped.append(r)
 
         deduped.sort(key=lambda x: bool(x.get("website")))
+        print(f"[search] returning={len(deduped)}")
         return deduped
     except Exception:
         _print_traceback()
@@ -502,7 +529,8 @@ def search_businesses(city: str, category: str, api_key: str, verify_nosite: boo
 
 
 if __name__ == "__main__":
-    results = search_businesses("Helsinki", "restaurant", "")
-    print(f"Found {len(results)} results")
+    api_key = (os.getenv("GOOGLE_API_KEY") or "").strip()
+    results = search_businesses("Helsinki", "restaurant", api_key)
+    print("RESULT COUNT:", len(results))
     for r in results[:3]:
         print(r)

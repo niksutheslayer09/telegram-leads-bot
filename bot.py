@@ -15,8 +15,22 @@ from dotenv import load_dotenv
 env_path = Path(__file__).with_name(".env")
 print("ENV PATH:", env_path)
 print("ENV EXISTS:", env_path.exists())
-print("ENV RAW CONTENT:")
-print(env_path.read_text(encoding="utf-8", errors="replace"))
+try:
+    raw_env = env_path.read_text(encoding="utf-8", errors="replace") if env_path.exists() else ""
+    masked_lines: list[str] = []
+    for line in (raw_env.splitlines() if raw_env else []):
+        if line.strip().startswith("TELEGRAM_TOKEN="):
+            v = line.split("=", 1)[1].strip()
+            masked_lines.append("TELEGRAM_TOKEN=" + ("***" + v[-4:] if len(v) >= 4 else "***"))
+        elif line.strip().startswith("GOOGLE_API_KEY="):
+            v = line.split("=", 1)[1].strip()
+            masked_lines.append("GOOGLE_API_KEY=" + ("***" + v[-4:] if len(v) >= 4 else "***"))
+        else:
+            masked_lines.append(line)
+    print("ENV PREVIEW (masked):")
+    print("\n".join(masked_lines))
+except Exception:
+    traceback.print_exc()
 
 load_dotenv(dotenv_path=env_path, override=True)
 
@@ -241,7 +255,9 @@ async def cmd_export(message: Message) -> None:
 @dp.message(Command("search"))
 async def cmd_search(message: Message) -> None:
     try:
+        print("[bot] /search received")
         text = (message.text or "").strip()
+        print("[bot] raw text:", text)
         parts = text.split()
         if len(parts) < 3:
             await message.answer(
@@ -255,6 +271,7 @@ async def cmd_search(message: Message) -> None:
 
         city = parts[1].strip()
         category = parts[2].strip()
+        print("[bot] parsed city:", city, "category:", category)
 
         nosite = False
         withsite = False
@@ -284,12 +301,23 @@ async def cmd_search(message: Message) -> None:
                 except Exception:
                     limit = 15
 
+        print(
+            "[bot] flags nosite=", nosite,
+            "withsite=", withsite,
+            "outdated=", only_outdated,
+            "broken=", only_broken,
+            "limit=", limit,
+        )
+
         if limit < 1:
             limit = 1
         if limit > 30:
             limit = 30
 
-        await message.answer("Ищу, подождите...")
+        if nosite:
+            await message.answer("Ищу и проверяю через Google Places Details, подождите...")
+        else:
+            await message.answer("Ищу, подождите...")
 
         filters = {
             "nosite": bool(nosite),
@@ -302,16 +330,24 @@ async def cmd_search(message: Message) -> None:
         now = int(time.time())
 
         cached_entry = cache.get(cache_key) if isinstance(cache, dict) else None
+        use_cache = False
+        results: list[dict[str, Any]] = []
+
         if isinstance(cached_entry, dict) and (now - int(cached_entry.get("ts") or 0) <= CACHE_TTL_SECONDS):
-            print("Using cached results")
-            results = cached_entry.get("results") or []
-            if not isinstance(results, list):
-                results = []
-        else:
+            cached_results = cached_entry.get("results")
+            if isinstance(cached_results, list) and cached_results:
+                print("Using cached results")
+                results = [r for r in cached_results if isinstance(r, dict)]
+                use_cache = True
+            else:
+                print("[bot] Cache hit but results are empty -> fetching fresh")
+
+        if not use_cache:
             print("Fetching fresh results")
             results = await asyncio.to_thread(scraper.search_businesses, city, category, google_api_key, nosite)
+            results = [r for r in (results or []) if isinstance(r, dict)]
 
-            results = [_normalize_website_state(r) for r in (results or []) if isinstance(r, dict)]
+            results = [_normalize_website_state(r) for r in results]
 
             if withsite:
                 results = [r for r in results if r.get("has_website") is True]
@@ -345,6 +381,7 @@ async def cmd_search(message: Message) -> None:
             _save_cache(cache)
 
         results = [_normalize_website_state(r) for r in (results or []) if isinstance(r, dict)]
+        print("[bot] results after normalize:", len(results))
 
         last_results_by_chat_id[int(message.chat.id)] = list(results)
 
@@ -352,21 +389,37 @@ async def cmd_search(message: Message) -> None:
             await message.answer("Ничего не найдено.")
             return
 
-        blocks = [_format_lead(r) for r in results]
+        blocks: list[str] = []
+        bad = 0
+        for r in results:
+            try:
+                blocks.append(_format_lead(r))
+            except Exception:
+                bad += 1
+                traceback.print_exc()
+                continue
+        if bad:
+            print(f"[bot] skipped malformed leads: {bad}")
 
         chunk: list[str] = []
         size = 0
         for b in blocks:
             add = len(b) + (2 if chunk else 0)
             if chunk and size + add > 3500:
-                await message.answer("\n\n".join(chunk))
+                try:
+                    await message.answer("\n\n".join(chunk))
+                except Exception:
+                    traceback.print_exc()
                 chunk = []
                 size = 0
             chunk.append(b)
             size += add
 
         if chunk:
-            await message.answer("\n\n".join(chunk))
+            try:
+                await message.answer("\n\n".join(chunk))
+            except Exception:
+                traceback.print_exc()
     except Exception:
         traceback.print_exc()
         try:
@@ -376,6 +429,7 @@ async def cmd_search(message: Message) -> None:
 
 async def main() -> None:
     print("✅ Bot started successfully!")
+    print("[bot] registering commands and starting polling")
     try:
         await bot.set_my_commands(
             [
@@ -385,6 +439,7 @@ async def main() -> None:
                 BotCommand(command="export", description="Экспорт результатов в CSV"),
             ]
         )
+        print("[bot] set_my_commands OK")
         await dp.start_polling(bot)
     except Exception:
         traceback.print_exc()
